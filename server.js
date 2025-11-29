@@ -1,143 +1,82 @@
-require('dotenv').config();
-const express = require('express');
-const bodyParser = require('body-parser');
-const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
-const { chromium } = require('playwright');
+const express = require("express");
+const bodyParser = require("body-parser");
+const fetch = require("node-fetch");
+const puppeteer = require("puppeteer");
+require("dotenv").config();
 
 const app = express();
-app.use(bodyParser.json({ limit: '1mb' }));
+app.use(bodyParser.json());
 
-const PORT = process.env.PORT || 3000;
-const EXPECTED_SECRET = process.env.SECRET;
-const EMAIL = process.env.EMAIL;
-
-// helper
-function jsonRes(res, status, obj) {
-  res.status(status).json(obj);
-}
-
-app.post('/quiz-hook', async (req, res) => {
-  if (!req.is('application/json')) {
-    return jsonRes(res, 400, { error: 'Invalid JSON or content-type' });
-  }
-
-  const payload = req.body;
-  if (!payload || typeof payload !== 'object') {
-    return jsonRes(res, 400, { error: 'Invalid JSON body' });
-  }
-
-  const { email, secret, url } = payload;
-
-  if (!email || !secret || !url) {
-    return jsonRes(res, 400, { error: 'Missing email, secret or url' });
-  }
-
-  if (secret !== EXPECTED_SECRET) {
-    return jsonRes(res, 403, { error: 'Invalid secret' });
-  }
-
-  jsonRes(res, 200, { received: true, status: 'processing' });
-
+app.post("/quiz-hook", async (req, res) => {
   try {
-    await solveQuiz(url, email, secret);
-    console.log('Quiz handled:', url);
+    const { email, secret, url } = req.body;
+    if (!email || !secret || !url)
+      return res.status(400).json({ error: "Invalid JSON" });
+
+    if (secret !== process.env.SECRET)
+      return res.status(403).json({ error: "Invalid secret" });
+
+    res.json({ received: true, status: "processing" });
+
+    await solveQuiz(url);
   } catch (err) {
-    console.error('Quiz error:', err);
+    console.error("Quiz handler error:", err);
   }
 });
 
-// MAIN QUIZ SOLVER
-async function solveQuiz(url, email, secret) {
-  const deadline = Date.now() + 170000;
+async function solveQuiz(quizUrl) {
+  try {
+    console.log("Loading:", quizUrl);
 
-  const browser = await chromium.launch();
-  const page = await browser.newPage();
+    const browser = await puppeteer.launch({
+      headless: "new",
+      args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    });
 
-  await page.goto(url, { waitUntil: 'networkidle' });
+    const page = await browser.newPage();
+    await page.goto(quizUrl, { waitUntil: "networkidle0" });
 
-  const pageText = await page.evaluate(() => document.body.innerText);
+    // Read everything on screen
+    const pageText = await page.evaluate(() => document.body.innerText);
+    console.log("Page loaded.");
 
-  const submitUrl = await findSubmitUrl(page);
-  if (!submitUrl) {
-    throw new Error('No submit URL found');
-  }
-
-  const fileUrl = await page.evaluate(() => {
-    const anchors = [...document.querySelectorAll('a')];
-    for (const a of anchors) {
-      if (a.href.match(/\.(csv|json|pdf)$/i)) {
-        return a.href;
-      }
+    // Find submit URL inside page text
+    const submitMatch = pageText.match(/https?:\/\/[^\s]+submit[^\s]*/);
+    if (!submitMatch) {
+      console.log("No submit URL found");
+      await browser.close();
+      return;
     }
-    return null;
-  });
+    const submitUrl = submitMatch[0];
 
-  let answer = null;
+    // Your logic - for testing we send answer=123
+    const answerPayload = {
+      email: process.env.EMAIL,
+      secret: process.env.SECRET,
+      url: quizUrl,
+      answer: 123
+    };
 
-  if (fileUrl && fileUrl.endsWith('.csv')) {
-    const csv = await (await fetch(fileUrl)).text();
-    answer = sumColumn(csv);
-  } else {
-    answer = 'unable_to_solve';
-  }
+    const response = await fetch(submitUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(answerPayload)
+    });
 
-  const payload = { email, secret, url, answer };
-  await postWithTimeout(submitUrl, payload, deadline);
+    const result = await response.json();
+    console.log("Submit response:", result);
 
-  await browser.close();
-}
-
-function sumColumn(csvText) {
-  const lines = csvText.trim().split('\n');
-  const headers = lines[0].split(',');
-  let idx = headers.findIndex(h => h.trim().toLowerCase() === 'value');
-
-  if (idx === -1) idx = 1;
-
-  let sum = 0;
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(',');
-    sum += parseFloat(cols[idx]) || 0;
-  }
-  return sum;
-}
-
-async function findSubmitUrl(page) {
-  return page.evaluate(() => {
-    const anchors = [...document.querySelectorAll('a')];
-    for (const a of anchors) {
-      if (/submit/i.test(a.innerText) || /submit/i.test(a.href)) return a.href;
+    if (result.url) {
+      console.log("Next quiz:", result.url);
+      await solveQuiz(result.url);
     }
 
-    const forms = [...document.querySelectorAll('form')];
-    for (const f of forms) if (f.action) return f.action;
-
-    const m = document.body.innerText.match(/https?:\/\/\S+/);
-    return m ? m[0] : null;
-  });
+    await browser.close();
+  } catch (e) {
+    console.error("Solve error:", e);
+  }
 }
 
-async function postWithTimeout(url, payload, deadline) {
-  const now = Date.now();
-  if (now > deadline) throw new Error('Deadline exceeded');
-
-  const ms = deadline - now - 1000;
-
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), ms);
-
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-    signal: controller.signal
-  });
-
-  clearTimeout(id);
-  const json = await resp.json().catch(() => null);
-  console.log('Submit response:', json);
-}
-
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Server running on port", process.env.PORT || 3000);
 });
